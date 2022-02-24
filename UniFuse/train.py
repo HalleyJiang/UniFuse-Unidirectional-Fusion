@@ -14,6 +14,7 @@ parser.add_argument("--dataset", default="matterport3d", choices=["3d60", "panos
 # system settings
 parser.add_argument("--num_workers", type=int, default=4, help="number of dataloader workers")
 parser.add_argument("--gpu_devices", type=int, nargs="+", default=[0], help="available gpus")
+parser.add_argument('--local_rank', type=int, default=0, help="the process to be lanched")
 
 # model settings
 parser.add_argument("--model_name", type=str, default="panodepth", help="folder to save the model in")
