@@ -23,9 +23,16 @@ class Trainer:
     def __init__(self, settings):
         self.settings = settings
 
-        self.device = torch.device("cuda" if len(self.settings.gpu_devices) else "cpu")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.gpu_devices = ','.join([str(id) for id in settings.gpu_devices])
-        os.environ["CUDA_VISIBLE_DEVICES"] = self.gpu_devices
+        if torch.cuda.is_available():
+            os.environ["CUDA_VISIBLE_DEVICES"] = self.gpu_devices
+            torch.cuda.set_device(self.settings.local_rank)
+
+        if len(self.settings.gpu_devices) > 1:
+            torch.distributed.init_process_group('nccl', init_method='env://',
+                                                 world_size=len(self.settings.gpu_devices),
+                                                 rank=self.settings.local_rank)
 
         self.log_path = os.path.join(self.settings.log_dir, self.settings.model_name)
 
@@ -51,16 +58,30 @@ class Trainer:
                                      self.settings.disable_color_augmentation,
                                      self.settings.disable_LR_filp_augmentation,
                                      self.settings.disable_yaw_rotation_augmentation, is_training=True)
-        self.train_loader = DataLoader(train_dataset, self.settings.batch_size, True,
-                                       num_workers=self.settings.num_workers, pin_memory=True, drop_last=True)
+
+        self.train_sampler = None if len(
+            self.settings.gpu_devices) < 2 else torch.utils.data.distributed.DistributedSampler(
+            train_dataset, num_replicas=len(self.settings.gpu_devices), rank=self.settings.local_rank)
+
+        self.train_loader = DataLoader(train_dataset, batch_size=self.settings.batch_size,
+                                       shuffle=(self.train_sampler is None), num_workers=self.settings.num_workers,
+                                       pin_memory=True, sampler=self.train_sampler, drop_last=True)
+
         num_train_samples = len(train_dataset)
         self.num_total_steps = num_train_samples // self.settings.batch_size * self.settings.num_epochs
 
         val_dataset = self.dataset(self.settings.data_path, val_file_list, self.settings.height, self.settings.width,
                                    self.settings.disable_color_augmentation, self.settings.disable_LR_filp_augmentation,
                                    self.settings.disable_yaw_rotation_augmentation, is_training=False)
-        self.val_loader = DataLoader(val_dataset, self.settings.batch_size, False,
-                                     num_workers=self.settings.num_workers, pin_memory=True, drop_last=True)
+
+        self.val_sampler = None if len(
+            self.settings.gpu_devices) < 2 else torch.utils.data.distributed.DistributedSampler(
+            val_dataset, num_replicas=len(self.settings.gpu_devices), rank=self.settings.local_rank)
+
+        self.val_loader = DataLoader(val_dataset, batch_size=self.settings.batch_size,
+                                     shuffle=(self.val_sampler is None), num_workers=self.settings.num_workers,
+                                     pin_memory=True, sampler=self.val_sampler, drop_last=True)
+
         # network
         Net_dict = {"UniFuse": UniFuse,
                     "Equi": Equi}
@@ -70,7 +91,15 @@ class Trainer:
                          self.settings.imagenet_pretrained, train_dataset.max_depth_meters,
                          fusion_type=self.settings.fusion, se_in_fusion=self.settings.se_in_fusion)
 
+        if len(self.settings.gpu_devices) > 1:
+            process_group = torch.distributed.new_group(list(range(len(self.settings.gpu_devices))))
+            self.model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model, process_group)
         self.model.to(self.device)
+        if len(self.settings.gpu_devices) > 1:
+            self.model = torch.nn.parallel.DistributedDataParallel(self.model,
+                                                                   device_ids=[self.settings.local_rank],
+                                                                   output_device=self.settings.local_rank)
+
         self.parameters_to_train = list(self.model.parameters())
 
         self.optimizer = optim.Adam(self.parameters_to_train, self.settings.learning_rate)
@@ -86,10 +115,12 @@ class Trainer:
         self.evaluator = Evaluator()
 
         self.writers = {}
-        for mode in ["train", "val"]:
-            self.writers[mode] = SummaryWriter(os.path.join(self.log_path, mode))
+        if self.settings.local_rank == 0:
+            for mode in ["train", "val"]:
+                self.writers[mode] = SummaryWriter(os.path.join(self.log_path, mode))
 
-        self.save_settings()
+        if self.settings.local_rank == 0:
+            self.save_settings()
 
     def train(self):
         """Run the entire training pipeline
@@ -101,7 +132,7 @@ class Trainer:
         for self.epoch in range(self.settings.num_epochs):
             self.train_one_epoch()
             self.validate()
-            if (self.epoch + 1) % self.settings.save_frequency == 0:
+            if (self.epoch + 1) % self.settings.save_frequency == 0 and self.settings.local_rank == 0:
                 self.save_model()
 
     def train_one_epoch(self):
@@ -134,7 +165,8 @@ class Trainer:
                 for i, key in enumerate(self.evaluator.metrics.keys()):
                     losses[key] = np.array(depth_errors[i].cpu())
 
-                self.log("train", inputs, outputs, losses)
+                if self.settings.local_rank == 0:
+                    self.log("train", inputs, outputs, losses)
 
             self.step += 1
 
@@ -177,7 +209,8 @@ class Trainer:
 
         for i, key in enumerate(self.evaluator.metrics.keys()):
             losses[key] = np.array(self.evaluator.metrics[key].avg.cpu())
-        self.log("val", inputs, outputs, losses)
+        if self.settings.local_rank == 0:
+            self.log("val", inputs, outputs, losses)
         del inputs, outputs, losses
 
     def log(self, mode, inputs, outputs, losses):
