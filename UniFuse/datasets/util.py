@@ -20,7 +20,7 @@ class Equirec2Cube:
         self._xyz2coor()
 
         # For convert R-distance to Z-depth for CubeMaps
-        cosmap = 0.5 / np.sqrt((2 * self.grid[..., 0]) ** 2 + (2 * self.grid[..., 1]) ** 2 + 0.5)
+        cosmap = 1.0 / np.sqrt((2 * self.grid[..., 0]) ** 2 + (2 * self.grid[..., 1]) ** 2 + 1.0)
         self.cosmaps = np.concatenate(6 * [cosmap], axis=1)[..., np.newaxis]
 
     def _xyzcube(self):
